@@ -9,7 +9,7 @@ from urllib.parse import urljoin, urlparse
 import pandas as pd
 from io import StringIO
 import concurrent.futures
-import undetected_chromedriver as uc
+import cloudscraper
 
 # ---------- SESSION STATE ----------
 if 'is_ready' not in st.session_state:
@@ -47,80 +47,99 @@ def extract_website_from_soup(soup, base_url):
             return href
     return ''
 
-# ---------- YELP SCRAPER (SELENIUM + UNDETECTED) ----------
-def scrape_yelp_selenium(url):
-    driver = None
+# ---------- YELP SCRAPER (NO SELENIUM, PURE CLOUDSCRAPER + REGEX) ----------
+def scrape_yelp(url):
+    """
+    Yelp ko Selenium ke baghair scrape karta hai.
+    __NEXT_DATA__ aur __APOLLO_STATE__ parse karta hai.
+    """
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
+    )
     try:
-        options = uc.ChromeOptions()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument(f'--user-agent={random.choice(USER_AGENTS)}')
-        
-        driver = uc.Chrome(options=options)
-        driver.get(url)
-        time.sleep(random.uniform(3, 5))  # Wait for JS to load
-        
-        html = driver.page_source
-        driver.quit()
-        driver = None
-        
+        resp = scraper.get(url, headers=get_headers(), timeout=30)
+        if resp.status_code != 200:
+            return None
+
+        html = resp.text
         soup = BeautifulSoup(html, 'lxml')
+
         name = ''
         phone = ''
         address = ''
         website = ''
         rating = ''
         categories = ''
-        
-        # Try JSON-LD
-        for script in soup.find_all('script', type='application/ld+json'):
+
+        # 1. Try to find __NEXT_DATA__ (Yelp mostly uses this)
+        next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if next_data_match:
             try:
-                data = json.loads(script.string)
-                if data.get('@type') == 'LocalBusiness':
-                    name = data.get('name', name)
-                    phone = data.get('telephone', phone)
-                    address = data.get('address', {}).get('streetAddress', address) if isinstance(data.get('address'), dict) else address
-                    website = data.get('url', website)
-                    rating = data.get('aggregateRating', {}).get('ratingValue', rating) if isinstance(data.get('aggregateRating'), dict) else rating
-                    break
-            except: pass
-        
-        # Try Apollo State
+                data = json.loads(next_data_match.group(1))
+                # Traverse the complex props
+                props = data.get('props', {})
+                page_props = props.get('pageProps', {})
+                business = page_props.get('business', {})
+                if business:
+                    name = business.get('name', name)
+                    phone = business.get('displayPhone', phone)
+                    location = business.get('location', {})
+                    if isinstance(location, dict):
+                        address = location.get('address1', address) or location.get('displayAddress', address)
+                    website = business.get('websiteUrl', website)
+                    rating = business.get('rating', rating)
+                    categories = ', '.join([c.get('title', '') for c in business.get('categories', []) if isinstance(c, dict)])
+            except:
+                pass
+
+        # 2. If __NEXT_DATA__ failed, try __APOLLO_STATE__
         if not name:
-            for script in soup.find_all('script'):
-                if script.string and '__APOLLO_STATE__' in script.string:
-                    try:
-                        json_str = re.search(r'window\.__APOLLO_STATE__\s*=\s*({.*?});', script.string, re.DOTALL)
-                        if json_str:
-                            data = json.loads(json_str.group(1))
-                            for key, value in data.items():
-                                if key.startswith('Business:') or key.startswith('BusinessV2:'):
-                                    biz = value
-                                    name = biz.get('name', name)
-                                    phone = biz.get('displayPhone', phone)
-                                    addr = biz.get('location', {})
-                                    if isinstance(addr, dict):
-                                        address = addr.get('address1', address)
-                                    website = biz.get('websiteUrl', website)
-                                    rating = biz.get('rating', rating)
-                                    categories = ', '.join([c.get('title', '') for c in biz.get('categories', []) if isinstance(c, dict)])
-                                    break
-                    except: pass
-        
-        # Fallback HTML
+            apollo_match = re.search(r'window\.__APOLLO_STATE__\s*=\s*({.*?});', html, re.DOTALL)
+            if apollo_match:
+                try:
+                    data = json.loads(apollo_match.group(1))
+                    for key, value in data.items():
+                        if key.startswith('Business:') or key.startswith('BusinessV2:'):
+                            biz = value
+                            name = biz.get('name', name)
+                            phone = biz.get('displayPhone', phone)
+                            addr = biz.get('location', {})
+                            if isinstance(addr, dict):
+                                address = addr.get('address1', address)
+                            website = biz.get('websiteUrl', website)
+                            rating = biz.get('rating', rating)
+                            categories = ', '.join([c.get('title', '') for c in biz.get('categories', []) if isinstance(c, dict)])
+                            break
+                except:
+                    pass
+
+        # 3. Fallback to direct HTML scraping if JSON failed
         if not name:
             h1 = soup.find('h1')
-            if h1: name = h1.get_text(strip=True)
+            if h1:
+                name = h1.get_text(strip=True)
+
         if not phone:
             phone_list = extract_phone_from_text(html)
             phone = phone_list[0] if phone_list else ''
+
+        if not address:
+            # Yelp often has address in a <p> tag inside the sidebar
+            for div in soup.find_all('div', class_=re.compile(r'address', re.I)):
+                txt = div.get_text(strip=True)
+                if 'Street' in txt or 'St' in txt or 'Ave' in txt:
+                    address = txt
+                    break
+            if not address:
+                for p in soup.find_all(['p', 'div']):
+                    txt = p.get_text()
+                    if re.search(r'\b\d{5}\b', txt) and ('Street' in txt or 'St' in txt or 'Ave' in txt):
+                        address = txt.strip()
+                        break
+
         if not website:
             website = extract_website_from_soup(soup, url)
-        
+
         if name:
             return {
                 'name': name.strip(),
@@ -134,12 +153,8 @@ def scrape_yelp_selenium(url):
         return None
     except Exception as e:
         return None
-    finally:
-        if driver:
-            try: driver.quit()
-            except: pass
 
-# ---------- CITYLOCAL101 SCRAPER (WITH RETRY & TIMEOUT) ----------
+# ---------- CITYLOCAL101 (WITH RETRY & TIMEOUT) ----------
 def fetch_with_retry(url, max_retries=3):
     for attempt in range(max_retries):
         try:
@@ -200,7 +215,7 @@ def scrape_citylocal(url):
 
 # ---------- BBB / YELLOWPAGES ----------
 def scrape_bbb(url):
-    scraper = requests.Session()
+    scraper = cloudscraper.create_scraper()
     try:
         resp = scraper.get(url, headers=get_headers(), timeout=30)
         if resp.status_code != 200: return None
@@ -233,8 +248,9 @@ def scrape_bbb(url):
     except: return None
 
 def scrape_yellowpages(url):
+    scraper = cloudscraper.create_scraper()
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=30)
+        resp = scraper.get(url, headers=get_headers(), timeout=30)
         if resp.status_code != 200: return None
         soup = BeautifulSoup(resp.text, 'lxml')
         name = soup.find('h1', {'class': re.compile(r'business-name', re.I)})
@@ -419,12 +435,12 @@ def generate_pitch(gap):
     if not gap.get('has_decision_maker'): return "👤 Decision maker not found → Pitch: LinkedIn Outreach + Direct Sales Strategy"
     return "🏆 Complete presence → Pitch: AI Chatbot Integration + Power BI Analytics + CRO (Upsell)"
 
-# ---------- PARALLEL PROCESSING (Speed up CityLocal) ----------
+# ---------- PARALLEL PROCESSING ----------
 def process_url(url):
     if 'bbb.org' in url:
         return scrape_bbb(url)
     elif 'yelp.com' in url:
-        return scrape_yelp_selenium(url)
+        return scrape_yelp(url)
     elif 'yellowpages.com' in url:
         return scrape_yellowpages(url)
     elif 'citylocal101.com' in url:
@@ -439,7 +455,6 @@ def process_leads(inputs, mode, api_key):
     failed_items = []
     if mode == 'urls':
         urls = [u.strip() for u in inputs.split('\n') if u.strip().startswith('http')]
-        # Parallel execution with 5 threads
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_to_url = {executor.submit(process_url, url): url for url in urls}
             for future in concurrent.futures.as_completed(future_to_url):
@@ -520,13 +535,15 @@ def process_leads(inputs, mode, api_key):
 
 # ---------- STREAMLIT UI ----------
 st.set_page_config(page_title="Sales Intelligence Engine", page_icon="🦊")
-st.title("🦊 Sales Intelligence Engine V3.0 (FIXED)")
-st.markdown("**Yelp (Selenium Bypass) + CityLocal (Parallel + Retry)**")
+st.title("🦊 Sales Intelligence Engine V4.0 (NO BROWSER)")
+st.markdown("**Yelp (Pure Requests) + CityLocal (Parallel)**")
 
-with st.expander("📌 Fixes Applied", expanded=True):
+with st.expander("📌 V4.0 Fix", expanded=True):
     st.write("""
-    - **Yelp:** Ab `undetected-chromedriver` use kar raha hai. Cloudflare bypass ho jayega.
-    - **CityLocal101:** Parallel processing (5 threads) + 60 sec timeout + auto-retry. Ab 10 URLs 10 minute nahi, 1-2 minute mein complete honge.
+    - ✅ **`undetected-chromedriver` hata diya** — ab Python 3.14/3.15 pe bhi chalega.
+    - ✅ **Yelp:** `__NEXT_DATA__` aur `__APOLLO_STATE__` parse karta hai.
+    - ✅ **CityLocal:** Parallel + 60 sec timeout.
+    - ✅ **Free & Permanent:** No browser installation required.
     """)
 
 mode = st.radio("Select Input Mode:", ["Paste URLs", "Keyword Search (Service + City)"])
@@ -544,7 +561,7 @@ if st.button("🚀 Generate Leads", type="primary"):
     if not urls_input.strip():
         st.error("❌ Kuch toh daalo!")
     else:
-        with st.spinner("Processing... (Parallel mode ON, 5 threads)"):
+        with st.spinner("Processing... (Parallel mode ON)"):
             rows, failed = process_leads(urls_input.strip(), 'urls' if mode == "Paste URLs" else 'keyword', api_key)
             if rows:
                 df = pd.DataFrame(rows)
@@ -574,4 +591,4 @@ if st.session_state.is_ready:
             st.session_state.is_ready = False
             st.rerun()
 
-st.caption("🦊 V3.0: Selenium for Yelp | Parallel for CityLocal")
+st.caption("🦊 V4.0: No Selenium, No distutils error. 100% Python 3.14 compatible.")
