@@ -47,15 +47,15 @@ def extract_website_from_soup(soup, base_url):
             return href
     return ''
 
-# ---------- YELP SCRAPER (NO SELENIUM, PURE CLOUDSCRAPER + REGEX) ----------
+# ---------- YELP SCRAPER (ROBUST + TYPO SUPPORT) ----------
 def scrape_yelp(url):
-    """
-    Yelp ko Selenium ke baghair scrape karta hai.
-    __NEXT_DATA__ aur __APOLLO_STATE__ parse karta hai.
-    """
+    # Auto-fix common typos
+    url = url.replace('yeip.com', 'yelp.com').replace('/diz/', '/biz/')
+    
     scraper = cloudscraper.create_scraper(
         browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False}
     )
+    
     try:
         resp = scraper.get(url, headers=get_headers(), timeout=30)
         if resp.status_code != 200:
@@ -71,12 +71,12 @@ def scrape_yelp(url):
         rating = ''
         categories = ''
 
-        # 1. Try to find __NEXT_DATA__ (Yelp mostly uses this)
+        # ----- METHOD 1: __NEXT_DATA__ (Primary) -----
         next_data_match = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
         if next_data_match:
             try:
                 data = json.loads(next_data_match.group(1))
-                # Traverse the complex props
+                # Yelp ka data structure thoda complex hai, isliye traverse
                 props = data.get('props', {})
                 page_props = props.get('pageProps', {})
                 business = page_props.get('business', {})
@@ -92,7 +92,7 @@ def scrape_yelp(url):
             except:
                 pass
 
-        # 2. If __NEXT_DATA__ failed, try __APOLLO_STATE__
+        # ----- METHOD 2: __APOLLO_STATE__ (Fallback) -----
         if not name:
             apollo_match = re.search(r'window\.__APOLLO_STATE__\s*=\s*({.*?});', html, re.DOTALL)
             if apollo_match:
@@ -113,7 +113,7 @@ def scrape_yelp(url):
                 except:
                     pass
 
-        # 3. Fallback to direct HTML scraping if JSON failed
+        # ----- METHOD 3: Direct HTML Scraping (Brute Force) -----
         if not name:
             h1 = soup.find('h1')
             if h1:
@@ -124,10 +124,10 @@ def scrape_yelp(url):
             phone = phone_list[0] if phone_list else ''
 
         if not address:
-            # Yelp often has address in a <p> tag inside the sidebar
-            for div in soup.find_all('div', class_=re.compile(r'address', re.I)):
+            # Yelp address is usually in a <p> with class containing 'address' or in the main container
+            for div in soup.find_all(['p', 'div', 'span'], class_=re.compile(r'address|location', re.I)):
                 txt = div.get_text(strip=True)
-                if 'Street' in txt or 'St' in txt or 'Ave' in txt:
+                if re.search(r'\b\d{5}\b', txt) and ('Street' in txt or 'St' in txt or 'Ave' in txt or 'Blvd' in txt):
                     address = txt
                     break
             if not address:
@@ -139,6 +139,11 @@ def scrape_yelp(url):
 
         if not website:
             website = extract_website_from_soup(soup, url)
+            # Agar nahi mila toh HTML me search karo
+            if not website:
+                web_match = re.search(r'(https?://[^\s"\']+\.(?:com|net|org|io|co|us|ca)[^\s"\']*)', html)
+                if web_match:
+                    website = web_match.group(1)
 
         if name:
             return {
@@ -435,8 +440,11 @@ def generate_pitch(gap):
     if not gap.get('has_decision_maker'): return "👤 Decision maker not found → Pitch: LinkedIn Outreach + Direct Sales Strategy"
     return "🏆 Complete presence → Pitch: AI Chatbot Integration + Power BI Analytics + CRO (Upsell)"
 
-# ---------- PARALLEL PROCESSING ----------
+# ---------- URL SANITIZATION + PARALLEL PROCESSING ----------
 def process_url(url):
+    # Auto-fix common typos
+    url = url.replace('yeip.com', 'yelp.com').replace('/diz/', '/biz/')
+    
     if 'bbb.org' in url:
         return scrape_bbb(url)
     elif 'yelp.com' in url:
@@ -535,15 +543,14 @@ def process_leads(inputs, mode, api_key):
 
 # ---------- STREAMLIT UI ----------
 st.set_page_config(page_title="Sales Intelligence Engine", page_icon="🦊")
-st.title("🦊 Sales Intelligence Engine V4.0 (NO BROWSER)")
-st.markdown("**Yelp (Pure Requests) + CityLocal (Parallel)**")
+st.title("🦊 Sales Intelligence Engine V4.1 (Auto Typo Fix)")
+st.markdown("**Yelp, CityLocal, BBB, YellowPages, LinkedIn**")
 
-with st.expander("📌 V4.0 Fix", expanded=True):
+with st.expander("📌 V4.1 What's New", expanded=True):
     st.write("""
-    - ✅ **`undetected-chromedriver` hata diya** — ab Python 3.14/3.15 pe bhi chalega.
-    - ✅ **Yelp:** `__NEXT_DATA__` aur `__APOLLO_STATE__` parse karta hai.
-    - ✅ **CityLocal:** Parallel + 60 sec timeout.
-    - ✅ **Free & Permanent:** No browser installation required.
+    - ✅ **Auto Typo Fix:** `yeip.com` → `yelp.com`, `/diz/` → `/biz/`
+    - ✅ **Yelp Robust Parser:** `__NEXT_DATA__`, `__APOLLO_STATE__`, aur raw HTML se data nikaalta hai.
+    - ✅ **Pure Requests:** No Selenium, Python 3.14/3.15 compatible.
     """)
 
 mode = st.radio("Select Input Mode:", ["Paste URLs", "Keyword Search (Service + City)"])
@@ -553,7 +560,8 @@ if mode == "Keyword Search (Service + City)":
     api_key = st.text_input("🔑 Google Places API Key:", type="password")
 
 if mode == "Paste URLs":
-    urls_input = st.text_area("🔗 Paste URLs (One per line):", height=200)
+    urls_input = st.text_area("🔗 Paste URLs (One per line):", height=200, 
+                              placeholder="https://www.yelp.com/biz/serano-lasalle")
 else:
     urls_input = st.text_input("🔍 Enter Service + City:", placeholder="Plumbing Chicago")
 
@@ -561,7 +569,7 @@ if st.button("🚀 Generate Leads", type="primary"):
     if not urls_input.strip():
         st.error("❌ Kuch toh daalo!")
     else:
-        with st.spinner("Processing... (Parallel mode ON)"):
+        with st.spinner("Processing... (Auto Typo Fix ON)"):
             rows, failed = process_leads(urls_input.strip(), 'urls' if mode == "Paste URLs" else 'keyword', api_key)
             if rows:
                 df = pd.DataFrame(rows)
@@ -591,4 +599,4 @@ if st.session_state.is_ready:
             st.session_state.is_ready = False
             st.rerun()
 
-st.caption("🦊 V4.0: No Selenium, No distutils error. 100% Python 3.14 compatible.")
+st.caption("🦊 V4.1: Auto Typo Fix | No Browser | 100% Python 3.14 Compatible")
