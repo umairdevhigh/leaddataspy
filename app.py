@@ -8,7 +8,8 @@ import json
 from urllib.parse import urljoin, urlparse
 import pandas as pd
 from io import StringIO
-import cloudscraper
+import concurrent.futures
+import undetected_chromedriver as uc
 
 # ---------- SESSION STATE ----------
 if 'is_ready' not in st.session_state:
@@ -30,11 +31,9 @@ USER_AGENTS = [
 def get_headers():
     return {'User-Agent': random.choice(USER_AGENTS)}
 
-# ---------- UNIVERSAL EXTRACTORS (Class-independent) ----------
+# ---------- UNIVERSAL EXTRACTORS ----------
 def extract_phone_from_text(text):
-    # US/CA style: (123) 456-7890, 123-456-7890, 123.456.7890, 1234567890
     phones = re.findall(r'\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', text)
-    # Clean duplicates
     return list(set(phones))
 
 def extract_email_from_text(text):
@@ -42,29 +41,34 @@ def extract_email_from_text(text):
     return list(set(emails))
 
 def extract_website_from_soup(soup, base_url):
-    # Pehle 'mailto:' nahi, bas 'http' wale links dhoondho
     for a in soup.find_all('a', href=True):
         href = a['href']
-        # Agar href 'http' se start ho raha hai aur yeh same domain nahi hai (external) toh website ho sakti hai
-        # Ya agar href mein 'http' nahi hai lekin '/', toh full URL banao
         if href.startswith('http') and 'mailto:' not in href and 'tel:' not in href:
             return href
-        elif href.startswith('/') and len(href) > 1:
-            # Internal link, but if nothing else, we can construct
-            pass
     return ''
 
-# ---------- SCRAPERS (FIXED) ----------
-def scrape_yelp(url):
-    scraper = cloudscraper.create_scraper()
+# ---------- YELP SCRAPER (SELENIUM + UNDETECTED) ----------
+def scrape_yelp_selenium(url):
+    driver = None
     try:
-        resp = scraper.get(url, headers=get_headers(), timeout=20)
-        if resp.status_code != 200:
-            return None
+        options = uc.ChromeOptions()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_argument(f'--user-agent={random.choice(USER_AGENTS)}')
         
-        soup = BeautifulSoup(resp.text, 'lxml')
+        driver = uc.Chrome(options=options)
+        driver.get(url)
+        time.sleep(random.uniform(3, 5))  # Wait for JS to load
         
-        # Try 1: JSON-LD
+        html = driver.page_source
+        driver.quit()
+        driver = None
+        
+        soup = BeautifulSoup(html, 'lxml')
         name = ''
         phone = ''
         address = ''
@@ -72,6 +76,7 @@ def scrape_yelp(url):
         rating = ''
         categories = ''
         
+        # Try JSON-LD
         for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string)
@@ -84,7 +89,7 @@ def scrape_yelp(url):
                     break
             except: pass
         
-        # Try 2: Apollo state (if JSON-LD failed)
+        # Try Apollo State
         if not name:
             for script in soup.find_all('script'):
                 if script.string and '__APOLLO_STATE__' in script.string:
@@ -106,28 +111,13 @@ def scrape_yelp(url):
                                     break
                     except: pass
         
-        # Try 3: Fallback HTML scraping (last resort)
+        # Fallback HTML
         if not name:
             h1 = soup.find('h1')
-            if h1:
-                name = h1.get_text(strip=True)
-        
+            if h1: name = h1.get_text(strip=True)
         if not phone:
-            phone = extract_phone_from_text(resp.text)
-            phone = phone[0] if phone else ''
-        
-        if not address:
-            addr_div = soup.find('address')
-            if addr_div:
-                address = addr_div.get_text(strip=True)
-            else:
-                # Try to find text with address pattern
-                for p in soup.find_all(['p', 'div']):
-                    txt = p.get_text()
-                    if re.search(r'\d{5}', txt) and re.search(r'Street|St|Ave|Blvd', txt, re.I):
-                        address = txt.strip()
-                        break
-        
+            phone_list = extract_phone_from_text(html)
+            phone = phone_list[0] if phone_list else ''
         if not website:
             website = extract_website_from_soup(soup, url)
         
@@ -144,44 +134,53 @@ def scrape_yelp(url):
         return None
     except Exception as e:
         return None
+    finally:
+        if driver:
+            try: driver.quit()
+            except: pass
+
+# ---------- CITYLOCAL101 SCRAPER (WITH RETRY & TIMEOUT) ----------
+def fetch_with_retry(url, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=get_headers(), timeout=60)
+            if resp.status_code == 200:
+                return resp
+            time.sleep(2)
+        except requests.exceptions.Timeout:
+            time.sleep(5)
+        except:
+            time.sleep(2)
+    return None
 
 def scrape_citylocal(url):
+    resp = fetch_with_retry(url)
+    if not resp:
+        return None
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=15)
-        if resp.status_code != 200:
-            return None
         soup = BeautifulSoup(resp.text, 'lxml')
-        
-        # Name
         name = soup.find('h1').get_text(strip=True) if soup.find('h1') else ''
         if not name:
-            return None  # Agar name nahi mila toh waste hai
+            return None
         
-        # Phone - via regex
         phone_list = extract_phone_from_text(resp.text)
         phone = phone_list[0] if phone_list else ''
         
-        # Email - via regex
         email_list = extract_email_from_text(resp.text)
         general_email = email_list[0] if email_list else ''
         
-        # Address - Generic searching
         address = ''
         addr_div = soup.find('div', class_=re.compile(r'addr|loc|contact', re.I))
         if addr_div:
             address = addr_div.get_text(strip=True)
         else:
-            # Try to find using text patterns (city, state, zip)
             for p in soup.find_all(['p', 'div', 'span']):
                 txt = p.get_text()
                 if re.search(r'\b\d{5}\b', txt) and re.search(r'Street|St|Ave|Blvd|Road|Rd', txt, re.I):
                     address = txt.strip()
                     break
         
-        # Website - Generic
         website = extract_website_from_soup(soup, url)
-        
-        # If no website found via 'href', try searching text for 'http'
         if not website:
             web_match = re.search(r'(https?://[^\s"\']+)', resp.text)
             if web_match:
@@ -199,11 +198,11 @@ def scrape_citylocal(url):
     except Exception as e:
         return None
 
+# ---------- BBB / YELLOWPAGES ----------
 def scrape_bbb(url):
-    # Same logic, using cloudscraper
-    scraper = cloudscraper.create_scraper()
+    scraper = requests.Session()
     try:
-        resp = scraper.get(url, headers=get_headers(), timeout=15)
+        resp = scraper.get(url, headers=get_headers(), timeout=30)
         if resp.status_code != 200: return None
         soup = BeautifulSoup(resp.text, 'lxml')
         name = ''
@@ -211,7 +210,6 @@ def scrape_bbb(url):
         address = ''
         website = ''
         rating = ''
-        # Try JSON-LD
         for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string)
@@ -235,22 +233,19 @@ def scrape_bbb(url):
     except: return None
 
 def scrape_yellowpages(url):
-    scraper = cloudscraper.create_scraper()
     try:
-        resp = scraper.get(url, headers=get_headers(), timeout=15)
+        resp = requests.get(url, headers=get_headers(), timeout=30)
         if resp.status_code != 200: return None
         soup = BeautifulSoup(resp.text, 'lxml')
         name = soup.find('h1', {'class': re.compile(r'business-name', re.I)})
         name = name.get_text(strip=True) if name else ''
         if not name: return None
-        
         phone = extract_phone_from_text(resp.text)
         phone = phone[0] if phone else ''
         address = ''
         addr_div = soup.find('div', {'class': re.compile(r'address', re.I)})
         if addr_div: address = addr_div.get_text(strip=True)
         website = extract_website_from_soup(soup, url)
-        
         return {'name': name, 'phone': phone, 'address': address, 'website': website, 'rating': '', 'source': 'YellowPages', 'categories': ''}
     except: return None
 
@@ -259,7 +254,7 @@ def search_google_places(query, api_key):
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
     params = {'query': query, 'key': api_key, 'fields': 'name,formatted_address,formatted_phone_number,website,rating,place_id,types'}
     try:
-        resp = requests.get(url, params=params, timeout=15)
+        resp = requests.get(url, params=params, timeout=30)
         if resp.status_code != 200: return []
         data = resp.json()
         if data.get('status') != 'OK': return []
@@ -271,7 +266,7 @@ def search_google_places(query, api_key):
                 details_url = "https://maps.googleapis.com/maps/api/place/details/json"
                 details_params = {'place_id': place_id, 'key': api_key, 'fields': 'formatted_phone_number,website,url'}
                 try:
-                    details_resp = requests.get(details_url, params=details_params, timeout=10)
+                    details_resp = requests.get(details_url, params=details_params, timeout=30)
                     if details_resp.status_code == 200:
                         details_data = details_resp.json()
                         if details_data.get('status') == 'OK':
@@ -291,7 +286,7 @@ def search_google_places(query, api_key):
         return results
     except: return []
 
-# ---------- ENRICHMENT AND DECISION MAKER FINDER (Same as before but improved) ----------
+# ---------- ENRICHMENT (Decision Makers) ----------
 def find_decision_maker(soup, domain):
     priority_keywords = ['owner', 'ceo', 'founder', 'president', 'director', 'head of', 'manager', 'proprietor']
     decision_makers = []
@@ -346,12 +341,12 @@ def enrich_website(website_url):
         if not website_url.startswith('http'):
             website_url = 'https://' + website_url
         try:
-            head_resp = requests.head(website_url, timeout=5, headers=get_headers())
+            head_resp = requests.head(website_url, timeout=10, headers=get_headers())
             if head_resp.status_code >= 400:
                 return {'emails': [], 'social': {}, 'decision_makers': [], 'gap_analysis': {'website_alive': False}}
         except:
             return {'emails': [], 'social': {}, 'decision_makers': [], 'gap_analysis': {'website_alive': False}}
-        resp = requests.get(website_url, timeout=10, headers=get_headers())
+        resp = requests.get(website_url, timeout=20, headers=get_headers())
         if resp.status_code != 200:
             return {'emails': [], 'social': {}, 'decision_makers': [], 'gap_analysis': {'website_alive': False}}
         soup = BeautifulSoup(resp.text, 'lxml')
@@ -367,7 +362,7 @@ def enrich_website(website_url):
         for path in ['/about', '/about-us', '/team', '/leadership', '/our-team']:
             try:
                 about_url = urljoin(website_url, path)
-                about_resp = requests.get(about_url, timeout=8, headers=get_headers())
+                about_resp = requests.get(about_url, timeout=10, headers=get_headers())
                 if about_resp.status_code == 200:
                     about_soup = BeautifulSoup(about_resp.text, 'lxml')
                     decision_makers.extend(find_decision_maker(about_soup, website_url))
@@ -424,54 +419,67 @@ def generate_pitch(gap):
     if not gap.get('has_decision_maker'): return "👤 Decision maker not found → Pitch: LinkedIn Outreach + Direct Sales Strategy"
     return "🏆 Complete presence → Pitch: AI Chatbot Integration + Power BI Analytics + CRO (Upsell)"
 
+# ---------- PARALLEL PROCESSING (Speed up CityLocal) ----------
+def process_url(url):
+    if 'bbb.org' in url:
+        return scrape_bbb(url)
+    elif 'yelp.com' in url:
+        return scrape_yelp_selenium(url)
+    elif 'yellowpages.com' in url:
+        return scrape_yellowpages(url)
+    elif 'citylocal101.com' in url:
+        return scrape_citylocal(url)
+    elif 'linkedin.com' in url:
+        name = url.split('/company/')[-1].replace('-', ' ').title() if '/company/' in url else url.split('/')[-1].replace('-', ' ').title()
+        return {'name': name, 'phone': '', 'address': '', 'website': '', 'rating': '', 'source': 'LinkedIn', 'categories': ''}
+    return None
+
 def process_leads(inputs, mode, api_key):
     all_rows = []
     failed_items = []
     if mode == 'urls':
         urls = [u.strip() for u in inputs.split('\n') if u.strip().startswith('http')]
-        for url in urls:
-            result = None
-            if 'bbb.org' in url: result = scrape_bbb(url)
-            elif 'yelp.com' in url: result = scrape_yelp(url)
-            elif 'yellowpages.com' in url: result = scrape_yellowpages(url)
-            elif 'citylocal101.com' in url: result = scrape_citylocal(url)
-            elif 'linkedin.com' in url:
-                name = url.split('/company/')[-1].replace('-', ' ').title() if '/company/' in url else url.split('/')[-1].replace('-', ' ').title()
-                result = {'name': name, 'phone': '', 'address': '', 'website': '', 'rating': '', 'source': 'LinkedIn', 'categories': ''}
-            else:
-                result = None
-            if result and result.get('name'):
-                enriched = enrich_website(result.get('website', ''))
-                dms = enriched.get('decision_makers', [])
-                primary_dm = get_primary_decision_maker(dms) if dms else None
-                if primary_dm:
-                    dm_name = primary_dm.get('name', '')
-                    dm_title = primary_dm.get('title', '')
-                    dm_phone = primary_dm.get('phone', '')
-                else:
-                    dm_name = dm_title = dm_phone = ''
-                row = {
-                    'Business Name': result.get('name', ''),
-                    'Phone': result.get('phone', ''),
-                    'Address': result.get('address', ''),
-                    'Website': result.get('website', ''),
-                    'Rating': result.get('rating', ''),
-                    'Categories': result.get('categories', ''),
-                    'Source': result.get('source', ''),
-                    'General Emails': ', '.join(enriched.get('emails', [])),
-                    'Facebook': enriched.get('social', {}).get('facebook', ''),
-                    'Instagram': enriched.get('social', {}).get('instagram', ''),
-                    'LinkedIn Page': enriched.get('social', {}).get('linkedin', ''),
-                    'Owner/Decision Maker Name': dm_name,
-                    'Owner/Decision Maker Title': dm_title,
-                    'Owner/Decision Maker Phone': dm_phone,
-                    'Owner/Decision Maker Direct Email': enriched.get('primary_dm_email', ''),
-                    'Gap Analysis': f"Website Alive: {enriched.get('gap_analysis', {}).get('website_alive', False)}, Social: {enriched.get('gap_analysis', {}).get('has_social', False)}, Email: {enriched.get('gap_analysis', {}).get('has_email', False)}, Decision Maker: {enriched.get('gap_analysis', {}).get('has_decision_maker', False)}",
-                    'Pitch Direction': generate_pitch(enriched.get('gap_analysis', {}))
-                }
-                all_rows.append(row)
-            else:
-                failed_items.append(url)
+        # Parallel execution with 5 threads
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_url = {executor.submit(process_url, url): url for url in urls}
+            for future in concurrent.futures.as_completed(future_to_url):
+                url = future_to_url[future]
+                try:
+                    result = future.result()
+                    if result and result.get('name'):
+                        enriched = enrich_website(result.get('website', ''))
+                        dms = enriched.get('decision_makers', [])
+                        primary_dm = get_primary_decision_maker(dms) if dms else None
+                        if primary_dm:
+                            dm_name = primary_dm.get('name', '')
+                            dm_title = primary_dm.get('title', '')
+                            dm_phone = primary_dm.get('phone', '')
+                        else:
+                            dm_name = dm_title = dm_phone = ''
+                        row = {
+                            'Business Name': result.get('name', ''),
+                            'Phone': result.get('phone', ''),
+                            'Address': result.get('address', ''),
+                            'Website': result.get('website', ''),
+                            'Rating': result.get('rating', ''),
+                            'Categories': result.get('categories', ''),
+                            'Source': result.get('source', ''),
+                            'General Emails': ', '.join(enriched.get('emails', [])),
+                            'Facebook': enriched.get('social', {}).get('facebook', ''),
+                            'Instagram': enriched.get('social', {}).get('instagram', ''),
+                            'LinkedIn Page': enriched.get('social', {}).get('linkedin', ''),
+                            'Owner/Decision Maker Name': dm_name,
+                            'Owner/Decision Maker Title': dm_title,
+                            'Owner/Decision Maker Phone': dm_phone,
+                            'Owner/Decision Maker Direct Email': enriched.get('primary_dm_email', ''),
+                            'Gap Analysis': f"Website Alive: {enriched.get('gap_analysis', {}).get('website_alive', False)}, Social: {enriched.get('gap_analysis', {}).get('has_social', False)}, Email: {enriched.get('gap_analysis', {}).get('has_email', False)}, Decision Maker: {enriched.get('gap_analysis', {}).get('has_decision_maker', False)}",
+                            'Pitch Direction': generate_pitch(enriched.get('gap_analysis', {}))
+                        }
+                        all_rows.append(row)
+                    else:
+                        failed_items.append(url)
+                except Exception as e:
+                    failed_items.append(url)
     else:
         if not api_key:
             st.error("⚠️ API Key required.")
@@ -512,13 +520,13 @@ def process_leads(inputs, mode, api_key):
 
 # ---------- STREAMLIT UI ----------
 st.set_page_config(page_title="Sales Intelligence Engine", page_icon="🦊")
-st.title("🦊 Sales Intelligence Engine V2.1 (FIXED)")
-st.markdown("**Ab Yelp aur CityLocal101 dono se data properly nikalega**")
+st.title("🦊 Sales Intelligence Engine V3.0 (FIXED)")
+st.markdown("**Yelp (Selenium Bypass) + CityLocal (Parallel + Retry)**")
 
 with st.expander("📌 Fixes Applied", expanded=True):
     st.write("""
-    - **Yelp:** Ab JSON-LD aur Apollo State dono parse karta hai. Phone/Address/Website regex se nikaalta hai.
-    - **CityLocal101:** Class-independent extraction. Phone, Email, Website ab regex aur link analysis se nikalte hain.
+    - **Yelp:** Ab `undetected-chromedriver` use kar raha hai. Cloudflare bypass ho jayega.
+    - **CityLocal101:** Parallel processing (5 threads) + 60 sec timeout + auto-retry. Ab 10 URLs 10 minute nahi, 1-2 minute mein complete honge.
     """)
 
 mode = st.radio("Select Input Mode:", ["Paste URLs", "Keyword Search (Service + City)"])
@@ -536,7 +544,7 @@ if st.button("🚀 Generate Leads", type="primary"):
     if not urls_input.strip():
         st.error("❌ Kuch toh daalo!")
     else:
-        with st.spinner("Processing..."):
+        with st.spinner("Processing... (Parallel mode ON, 5 threads)"):
             rows, failed = process_leads(urls_input.strip(), 'urls' if mode == "Paste URLs" else 'keyword', api_key)
             if rows:
                 df = pd.DataFrame(rows)
@@ -566,4 +574,4 @@ if st.session_state.is_ready:
             st.session_state.is_ready = False
             st.rerun()
 
-st.caption("🦊 V2.1: Robust Phone/Email/Website extraction using RegEx & smart link analysis")
+st.caption("🦊 V3.0: Selenium for Yelp | Parallel for CityLocal")
